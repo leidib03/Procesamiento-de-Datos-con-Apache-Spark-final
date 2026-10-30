@@ -1,0 +1,217 @@
+# -*- coding: utf-8 -*-
+"""Generador de datos en tiempo real -> Kafka. Autora: Leidi Bonilla"""
+import json, random, time
+from datetime import datetime
+from kafka import KafkaProducer
+
+AUTOR = "Leidi Bonilla"
+TOPIC = "casos_covid"
+DEPS = ["BOGOTA", "ANTIOQUIA", "VALLE DEL CAUCA", "CUNDINAMARCA", "ATLANTICO",
+        "SANTANDER", "BOLIVAR", "NARIÑO", "TOLIMA", "CALDAS"]
+producer = KafkaProducer(bootstrap_servers="localhost:9092",
+                         value_serializer=lambda v: json.dumps(v).encode("utf-8"))
+print(f"Productor iniciado - Autora: {AUTOR} - topic: {TOPIC}")
+i = 0
+while True:
+    evento = {"id_caso": i, "departamento": random.choices(DEPS, weights=[30,20,12,8,7,6,5,4,4,4])[0],
+              "sexo": random.choice(["F", "M"]), "edad": random.randint(0, 95),
+              "estado": random.choices(["Leve", "Moderado", "Grave", "Fallecido"], weights=[70,18,8,4])[0],
+              "fecha_evento": datetime.now().isoformat()}
+    producer.send(TOPIC, evento)
+    print("Enviado:", evento)
+    i += 1
+    time.sleep(0.5)
+
+# Tarea 3 – Procesamiento de Datos con Apache Spark y Kafka
+**Curso:** Big Data (202016911) – UNAD  **Autora:** Leidi Bonilla
+
+## Problema
+Analizar los casos positivos de COVID-19 en Colombia (datos abiertos, datos.gov.co) para identificar
+distribución por departamento, sexo, grupo de edad y tendencia mensual, y simular su llegada en tiempo real.
+
+## Dataset
+https://www.datos.gov.co/ (id `gt2j-8ykr`). El script lo descarga automáticamente.
+
+## Requisitos
+Python 3.9+, Java 11 o 17, Apache Kafka 3.x (para streaming).
+
+```bash
+pip install -r requirements.txt
+```
+
+## Ejecución batch
+```bash
+python batch_spark.py
+```
+Los gráficos quedan en `resultados/`.
+
+## Ejecución en tiempo real
+```bash
+# Terminal 1 (Kafka KRaft, desde la carpeta de Kafka)
+bin/kafka-storage.sh format -t $(bin/kafka-storage.sh random-uuid) -c config/kraft/server.properties
+bin/kafka-server-start.sh config/kraft/server.properties
+# Terminal 2
+bin/kafka-topics.sh --create --topic casos_covid --bootstrap-server localhost:9092 --partitions 3 --replication-factor 1
+python producer_kafka.py
+# Terminal 3
+python streaming_spark.py
+```
+
+pyspark==3.5.1
+matplotlib
+pandas
+kafka-python-ng
+
+# -*- coding: utf-8 -*-
+"""Spark Structured Streaming consumiendo Kafka. Autora: Leidi Bonilla"""
+import os
+from pyspark.sql import SparkSession, functions as F
+from pyspark.sql.types import *
+import matplotlib
+matplotlib.use("Agg")
+import matplotlib.pyplot as plt
+
+AUTOR = "Leidi Bonilla"
+os.makedirs("resultados", exist_ok=True)
+spark = (SparkSession.builder.appName(f"Streaming_{AUTOR}")
+         .config("spark.jars.packages", "org.apache.spark:spark-sql-kafka-0-10_2.12:3.5.1")
+         .config("spark.sql.shuffle.partitions", "4").getOrCreate())
+spark.sparkContext.setLogLevel("WARN")
+print(f"=== Spark Streaming + Kafka | Autora: {AUTOR} ===")
+
+esquema = StructType([StructField("id_caso", IntegerType()), StructField("departamento", StringType()),
+                      StructField("sexo", StringType()), StructField("edad", IntegerType()),
+                      StructField("estado", StringType()), StructField("fecha_evento", StringType())])
+
+crudo = (spark.readStream.format("kafka").option("kafka.bootstrap.servers", "localhost:9092")
+         .option("subscribe", "casos_covid").option("startingOffsets", "latest").load())
+eventos = (crudo.select(F.from_json(F.col("value").cast("string"), esquema).alias("e")).select("e.*"))
+
+conteo = eventos.groupBy("departamento").agg(F.count("*").alias("total"), F.round(F.avg("edad"), 1).alias("edad_prom"))
+
+def mostrar(batch_df, batch_id):
+    pdf = batch_df.toPandas().sort_values("total", ascending=False)
+    print(f"\n--- Micro-lote {batch_id} | {AUTOR} ---"); print(pdf.to_string(index=False))
+    plt.figure(figsize=(9, 4.5)); plt.bar(pdf["departamento"], pdf["total"])
+    plt.xticks(rotation=45, ha="right")
+    plt.title(f"Casos en tiempo real por departamento (lote {batch_id})\nElaborado por: {AUTOR}")
+    plt.tight_layout(); plt.savefig("resultados/streaming_tiempo_real.png", dpi=110); plt.close()
+
+q = (conteo.writeStream.outputMode("complete").foreachBatch(mostrar)
+     .trigger(processingTime="10 seconds").start())
+q.awaitTermination()
+
+data/
+resultados/
+__pycache__/
+*.pyc
+
+# -*- coding: utf-8 -*-
+"""
+Tarea 3 - Big Data (UNAD 202016911)
+Procesamiento en batch con Apache Spark (PySpark)
+Autora: Leidi Bonilla
+Dataset: Casos positivos de COVID-19 en Colombia (datos.gov.co, id gt2j-8ykr)
+"""
+import os, re, unicodedata, urllib.request
+from pyspark.sql import SparkSession, functions as F
+import matplotlib
+matplotlib.use("Agg")
+import matplotlib.pyplot as plt
+
+AUTOR = "Leidi Bonilla"
+URL = "https://www.datos.gov.co/api/views/gt2j-8ykr/rows.csv?accessType=DOWNLOAD"
+RUTA = "data/covid_colombia.csv"
+os.makedirs("data", exist_ok=True)
+os.makedirs("resultados", exist_ok=True)
+
+print("=" * 60)
+print(f" TAREA 3 - PROCESAMIENTO BATCH CON SPARK  |  Autora: {AUTOR}")
+print("=" * 60)
+
+# 1. CARGA desde la fuente original
+if not os.path.exists(RUTA):
+    print("Descargando dataset desde datos.gov.co ...")
+    urllib.request.urlretrieve(URL, RUTA)
+
+spark = (SparkSession.builder.appName(f"Batch_COVID_{AUTOR}")
+         .config("spark.sql.shuffle.partitions", "8").getOrCreate())
+spark.sparkContext.setLogLevel("WARN")
+df = spark.read.csv(RUTA, header=True, inferSchema=False)
+
+# Normalizar nombres de columnas (sin tildes, minúsculas, guion bajo)
+def norm(s):
+    s = unicodedata.normalize("NFKD", s).encode("ascii", "ignore").decode()
+    return re.sub(r"[^a-z0-9]+", "_", s.lower()).strip("_")
+df = df.toDF(*[norm(c) for c in df.columns])
+print("Columnas:", df.columns)
+df.printSchema()
+
+def buscar(*claves):
+    return next((c for c in df.columns if all(k in c for k in claves)), None)
+
+c_dep = buscar("nombre", "departamento")
+c_sexo = buscar("sexo")
+c_edad = buscar("edad")
+c_estado = buscar("estado")
+c_fecha = buscar("fecha", "notificacion") or buscar("fecha", "reporte")
+print("Columnas usadas ->", c_dep, c_sexo, c_edad, c_estado, c_fecha)
+
+total_inicial = df.count()
+print("Registros iniciales:", total_inicial)
+
+# 2. LIMPIEZA Y TRANSFORMACIÓN
+df = df.dropDuplicates()
+df = (df.withColumn("departamento", F.upper(F.trim(F.col(c_dep))))
+        .withColumn("sexo", F.upper(F.trim(F.col(c_sexo))))
+        .withColumn("edad", F.col(c_edad).cast("int"))
+        .withColumn("estado", F.initcap(F.trim(F.col(c_estado))))
+        .withColumn("fecha", F.coalesce(
+            F.to_date(F.substring(F.col(c_fecha), 1, 10), "yyyy-MM-dd"),
+            F.to_date(F.substring(F.col(c_fecha), 1, 10), "dd/MM/yyyy"))))
+df = df.filter(F.col("edad").between(0, 120)).dropna(subset=["departamento", "sexo", "edad"])
+df = df.withColumn("grupo_edad", F.when(F.col("edad") < 18, "0-17")
+                   .when(F.col("edad") < 30, "18-29").when(F.col("edad") < 45, "30-44")
+                   .when(F.col("edad") < 60, "45-59").otherwise("60+"))
+df = df.withColumn("anio_mes", F.date_format("fecha", "yyyy-MM")).cache()
+print("Registros tras limpieza:", df.count())
+
+# 3. EDA con DataFrames
+print("\n--- Nulos por columna ---")
+df.select([F.sum(F.col(c).isNull().cast("int")).alias(c)
+           for c in ["departamento", "sexo", "edad", "estado", "fecha"]]).show()
+print("--- Estadísticos de edad ---")
+df.select("edad").describe().show()
+
+por_dep = df.groupBy("departamento").count().orderBy(F.desc("count")).limit(10).toPandas()
+por_sexo = df.groupBy("sexo").count().toPandas()
+por_edad = df.groupBy("grupo_edad").count().orderBy("grupo_edad").toPandas()
+por_mes = df.groupBy("anio_mes").count().orderBy("anio_mes").dropna().toPandas()
+por_estado = df.groupBy("estado").count().orderBy(F.desc("count")).toPandas()
+for nombre, t in [("Departamento", por_dep), ("Sexo", por_sexo), ("Grupo edad", por_edad), ("Estado", por_estado)]:
+    print(f"--- Casos por {nombre} ---"); print(t.to_string(index=False))
+
+# 4. Demostración con RDDs (flatMap, map, reduceByKey, take, collect)
+rdd = df.select("departamento", "sexo").rdd.map(lambda r: ((r[0], r[1]), 1))
+top_rdd = rdd.reduceByKey(lambda a, b: a + b).sortBy(lambda x: -x[1])
+print("--- RDD: top 5 (departamento, sexo) ---", top_rdd.take(5))
+
+# 5. VISUALIZACIÓN
+def grafico(x, y, titulo, archivo, horizontal=False, kind="bar"):
+    plt.figure(figsize=(10, 5))
+    if kind == "line":
+        plt.plot(x, y, marker="o")
+        plt.xticks(rotation=90, fontsize=6)
+    elif horizontal:
+        plt.barh(x, y); plt.gca().invert_yaxis()
+    else:
+        plt.bar(x, y)
+    plt.title(f"{titulo}\nElaborado por: {AUTOR}")
+    plt.tight_layout(); plt.savefig(f"resultados/{archivo}", dpi=120); plt.close()
+
+grafico(por_dep["departamento"], por_dep["count"], "Top 10 departamentos con más casos", "01_departamentos.png", True)
+grafico(por_sexo["sexo"], por_sexo["count"], "Casos por sexo", "02_sexo.png")
+grafico(por_edad["grupo_edad"], por_edad["count"], "Casos por grupo de edad", "03_edad.png")
+grafico(por_mes["anio_mes"], por_mes["count"], "Casos por mes", "04_mes.png", kind="line")
+print(f"\nGráficos guardados en ./resultados  |  Autora: {AUTOR}")
+spark.stop()
